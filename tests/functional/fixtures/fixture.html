@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>observe-brum functional test fixture</title>
+  <script>
+    window.OBSERVE_BRUM = {
+      endpoint:          '', // same-origin: posts back to the mock collector serving this page
+      service_name:      'functional-test-app',
+      environment:       'test',
+      service_version:   '0.0.0-functional',
+      trace_mode:        'unified',
+      trace_sample_rate: 1.0,
+      compress:          false, // keep mock collector decoding plain JSON, no gzip
+      console_banner:    false,
+      // Agent-side RED metrics, so the functional run exercises the span-metrics
+      // processor against a real browser and a real fetch.
+      agent_metrics:     { enabled: true },
+    };
+  </script>
+  <script src="/observe-brum.js"></script>
+</head>
+<body>
+  <h1>observe-brum functional test fixture</h1>
+  <button id="click-target">Click me</button>
+  <img id="lcp-image" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBTAA7" width="200" height="200" alt="lcp candidate">
+
+  <script>
+    // Exercised by the Go test via chromedp. Kept as plain globals so
+    // Actions can call them directly without inline JS string fragility.
+    window.__test = {
+      logSomething: () => console.log('functional-test console log'),
+      throwError: () => { setTimeout(() => { throw new Error('functional-test thrown error'); }, 0); },
+      fetchSomething: () => fetch('/fixture.html', { method: 'GET' }).catch(() => {}),
+    };
+  </script>
+</body>
+</html>

@@ -1,0 +1,50 @@
+{
+  "name": "@observe/browser-rum",
+  "version": "0.0.5",
+  "description": "Observe Browser RUM - OpenTelemetry-based real user monitoring for web applications",
+  "main": "./dist/observe-brum.js",
+  "files": [
+    "dist/observe-brum.js"
+  ],
+  "scripts": {
+    "build": "./build.sh",
+    "build:dev": "./build.sh --dev",
+    "test": "./test.sh",
+    "test:coverage": "./test.sh --coverage",
+    "test:unit": "jest",
+    "test:watch": "jest --watch",
+    "deps:check": "npm-check-updates",
+    "deps:otel": "npm-check-updates '@opentelemetry/*' -u && npm install",
+    "deps:doctor": "npm-check-updates -u --doctor"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/api-logs": "^0.222.0",
+    "@opentelemetry/auto-instrumentations-web": "^0.67.0",
+    "@opentelemetry/context-zone": "^2.11.0",
+    "@opentelemetry/exporter-logs-otlp-http": "^0.222.0",
+    "@opentelemetry/exporter-metrics-otlp-http": "^0.222.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.222.0",
+    "@opentelemetry/instrumentation": "^0.222.0",
+    "@opentelemetry/opentelemetry-browser-detector": "^0.222.0",
+    "@opentelemetry/resources": "^2.11.0",
+    "@opentelemetry/sdk-logs": "^0.222.0",
+    "@opentelemetry/sdk-metrics": "^2.11.0",
+    "@opentelemetry/sdk-trace-base": "^2.11.0",
+    "@opentelemetry/sdk-trace-web": "^2.11.0",
+    "@opentelemetry/semantic-conventions": "^1.43.0",
+    "web-vitals": "^6.2.1",
+    "zone.js": "^0.16.3"
+  },
+  "devDependencies": {
+    "@jest/globals": "^30.5.1",
+    "esbuild": "^0.28.2",
+    "jest": "^30.5.1",
+    "jest-environment-jsdom": "^30.5.1",
+    "npm-check-updates": "^23.1.0"
+  },
+  "overrides": {
+    "@opentelemetry/semantic-conventions": "$@opentelemetry/semantic-conventions",
+    "@opentelemetry/api": "$@opentelemetry/api"
+  }
+}

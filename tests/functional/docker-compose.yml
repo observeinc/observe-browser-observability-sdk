@@ -1,0 +1,17 @@
+services:
+  chrome:
+    image: chromedp/headless-shell:latest
+
+  gotest:
+    image: golang:1.22
+    working_dir: /app/tests/functional
+    volumes:
+      - ../..:/app
+    environment:
+      CHROME_URL: "http://chrome:9222"
+      COLLECTOR_URL: "http://gotest:8089"
+      LISTEN_ADDR: ":8089"
+      DEBUG_DUMP: "${DEBUG_DUMP:-}"
+    command: ["go", "test", "./...", "-v", "-timeout=120s"]
+    depends_on:
+      - chrome
