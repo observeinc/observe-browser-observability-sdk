@@ -37,11 +37,25 @@ The bundle format is IIFE, a self-running function that needs no module loader.
 
 ## Version Stamping
 
-The build stamps a version string into the bundle at build time, through the `__BRUM_VERSION__` esbuild define. The bundle reads this value and emits it as a resource attribute. The script resolves the version in this order: the `VERSION` environment variable, the version field in `package.json`, then a fallback of `0.0.1`. In development builds, the script appends a UTC timestamp to the version, for example `0.0.5-20260101T120000Z`.
+The build stamps a version string into the bundle at build time, through the `__BRUM_VERSION__` esbuild define. The bundle reads this value and emits it as a resource attribute. The script resolves the version in this order: the `VERSION` environment variable, the version field in `package.json`, then a fallback of `0.0.1`. In development builds, the script appends a UTC timestamp to the version, for example `0.1.0-20260101T120000Z`.
 
 ## Build Output
 
 The build writes one file, `dist/observe-brum.js`, in IIFE format. Production builds are minified. Development builds skip minification and also write a sourcemap, `dist/observe-brum.js.map`, for easier debugging.
+
+## Releases
+
+The Release workflow in `.github/workflows/release.yml` publishes a GitHub release. The release has one asset, the production `dist/observe-brum.js`. The tag is `v` plus the version in `package.json`, for example `v0.1.0`.
+
+To publish a release:
+
+1. Set the new version in `package.json` and push the change.
+2. In the GitHub repository, open Actions, then select Release.
+3. Select Run workflow, then select the branch to release from.
+4. If the release is not stable, select the pre-release option.
+5. Select Run workflow to start the run.
+
+The workflow installs dependencies, builds the bundle, and runs the unit tests. If a step fails, the workflow does not publish a release. If a release with the same tag exists, the workflow stops before the build.
 
 ## Dependency Management
 

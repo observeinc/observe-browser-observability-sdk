@@ -16,6 +16,8 @@
       // Agent-side RED metrics, so the functional run exercises the span-metrics
       // processor against a real browser and a real fetch.
       agent_metrics:     { enabled: true },
+      // Default trace: 'separate', so clicks go to the interaction trace that page_view names.
+      user_interactions: true,
     };
   </script>
   <script src="/observe-brum.js"></script>
@@ -33,6 +35,10 @@
       throwError: () => { setTimeout(() => { throw new Error('functional-test thrown error'); }, 0); },
       fetchSomething: () => fetch('/fixture.html', { method: 'GET' }).catch(() => {}),
     };
+    // The click handler makes a request, so the test can assert it nests under the click.
+    document.getElementById('click-target').addEventListener('click', () => {
+      fetch('/fixture.html?from=click', { method: 'GET' }).catch(() => {});
+    });
   </script>
 </body>
 </html>
