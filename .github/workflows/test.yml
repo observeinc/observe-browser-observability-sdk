@@ -1,0 +1,54 @@
+# Runs the unit and functional tests on every pull request that targets main.
+name: Test
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A new push to the same pull request cancels the run that is still in progress.
+concurrency:
+  group: test-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Unit tests (Jest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The bundle tests load dist/observe-brum.js, so the build runs first.
+      - name: Build
+        run: ./build.sh
+
+      - name: Test
+        run: npm run test:coverage
+
+  functional:
+    name: Functional tests (Go and headless Chrome)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Builds the bundle, then runs the Docker Compose suite in tests/functional.
+      - name: Test
+        run: ./test.sh --functional
