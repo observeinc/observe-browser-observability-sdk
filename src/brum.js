@@ -15,12 +15,10 @@
 // brum.js is the Observe BRUM bundle. Configure via window.OBSERVE_BRUM in the
 // page <head> before this script loads.
 
-import { trace, metrics, context, SpanKind, SpanStatusCode, ValueType } from '@opentelemetry/api';
-import { logs, SeverityNumber } from '@opentelemetry/api-logs';
+import { trace, metrics, logs, context, propagation, ROOT_CONTEXT, SpanKind, SpanStatusCode, SeverityNumber, TraceFlags, ValueType } from '@opentelemetry/api';
 import { defaultResource, resourceFromAttributes, detectResources } from '@opentelemetry/resources';
 
-import { WebTracerProvider } from '@opentelemetry/sdk-trace-web';
-import { BatchSpanProcessor, TraceIdRatioBasedSampler, ParentBasedSampler } from '@opentelemetry/sdk-trace-base';
+import { TracerProvider, BatchSpanProcessor, TraceIdRatioBasedSampler, ParentBasedSampler, RandomIdGenerator } from '@opentelemetry/sdk-trace';
 import { ZoneContextManager } from '@opentelemetry/context-zone';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 
@@ -35,10 +33,11 @@ import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-http';
 import { LoggerProvider, BatchLogRecordProcessor } from '@opentelemetry/sdk-logs';
 import { OTLPLogExporter } from '@opentelemetry/exporter-logs-otlp-http';
 
-import { ExportResultCode } from '@opentelemetry/core';
+import { ExportResultCode, CompositePropagator, W3CTraceContextPropagator, W3CBaggagePropagator } from '@opentelemetry/core';
 
 import { registerInstrumentations } from '@opentelemetry/instrumentation';
 import { getWebAutoInstrumentations } from '@opentelemetry/auto-instrumentations-web';
+import { UserInteractionInstrumentation } from '@opentelemetry/instrumentation-user-interaction';
 import { browserDetector } from '@opentelemetry/opentelemetry-browser-detector';
 
 // Semconv keys from the OTel library, so spelling tracks the SDK.
@@ -74,6 +73,14 @@ import {
 } from '@opentelemetry/semantic-conventions/incubating';
 
 import { onLCP, onINP, onCLS, onFCP, onTTFB } from 'web-vitals';
+
+// Event-based instrumentations from opentelemetry-browser. Each emits OTel log events
+// and sits behind its own option. The agent's own capture stays the default.
+import { WebVitalsInstrumentation } from '@opentelemetry/browser-instrumentation/experimental/web-vitals';
+import { ErrorsInstrumentation } from '@opentelemetry/browser-instrumentation/experimental/errors';
+import { NavigationInstrumentation } from '@opentelemetry/browser-instrumentation/experimental/navigation';
+import { NavigationTimingInstrumentation } from '@opentelemetry/browser-instrumentation/experimental/navigation-timing';
+import { ResourceTimingInstrumentation } from '@opentelemetry/browser-instrumentation/experimental/resource-timing';
 
 import {
     BRUM_SDK_NAME,
@@ -123,6 +130,25 @@ const _DEFAULT_SCRUB_PARAMS = [
     'sig', 'X-Amz-Signature', 'X-Amz-Credential', 'X-Amz-Security-Token', 'X-Goog-Signature',
 ];
 
+// Default user-interaction events: every discrete user action from HTMLElement and its
+// inherited Element events (https://developer.mozilla.org/en-US/docs/Web/API/HTMLElement#events).
+// The plugin records an event only when the page listens for it, and makes one span per
+// listener call. Continuous events (drag, dragover, dragenter, dragleave, input, key*,
+// pointer*, mouse*, touch*, wheel, scroll, focus*) and resource events (load, error) stay
+// opt-in through user_interactions.event_names.
+const _DEFAULT_UI_EVENTS = [
+    // Pointer actions.
+    'click', 'dblclick', 'auxclick', 'contextmenu',
+    // Forms.
+    'submit', 'reset', 'change',
+    // Clipboard.
+    'copy', 'cut', 'paste',
+    // HTMLElement: invoker commands, popovers, <dialog> and <details>, interest invokers.
+    'command', 'beforetoggle', 'toggle', 'interest', 'loseinterest',
+    // HTMLElement: drag and drop, start and end only.
+    'dragstart', 'dragend', 'drop',
+];
+
 const cfg = {
     endpoint:          _c.endpoint !== undefined ? _c.endpoint : '',
     bearer_token:      _c.bearer_token || '',
@@ -144,7 +170,10 @@ const cfg = {
     service_name:      _c.service_name    || 'observe-brum-app',
     environment:       _c.environment     || 'production',
     service_version:   _c.service_version || '',
-    service_namespace: _c.service_namespace || '',
+    // null (absent, null, or an empty string) keeps the key off the resource. Only the
+    // RED metrics resource falls back to '' (see redMetricsResource).
+    service_namespace: (typeof _c.service_namespace === 'string' && _c.service_namespace.trim() !== '')
+        ? _c.service_namespace : null,
 
     trace_mode:        ['unified', 'split', 'stock'].indexOf(_c.trace_mode) >= 0 ? _c.trace_mode : 'unified',
 
@@ -152,14 +181,44 @@ const cfg = {
     metrics:           _bool(_c.metrics),
     logs:              _bool(_c.logs),
     cwv_metrics:       _bool(_c.cwv_metrics),
+    // Core Web Vitals destination, when cwv_metrics is on.
+    // 'metrics' = web.vitals.* histograms (default)
+    // 'events'  = browser.web_vital log events from the OTel WebVitalsInstrumentation (needs logs)
+    cwv_mode:          _c.cwv_mode === 'events' ? 'events' : 'metrics',
     errors:            _bool(_c.errors),
     // 'logs' = OTel log records only (default)
     // 'span' = span events only (recordException on page_view span)
     // 'dual' = both
     error_mode:        (['logs', 'span', 'dual'].indexOf(_c.error_mode) >= 0 ? _c.error_mode : 'logs'),
+    // Who writes the error log record when error_mode includes logs.
+    // 'agent' = the agent's own capture (default)
+    // 'otel'  = 'exception' log events from the OTel ErrorsInstrumentation
+    // The span event and the page_view ERROR status stay with the agent in both.
+    error_source:      _c.error_source === 'otel' ? 'otel' : 'agent',
+    // browser.navigation log events (hard load and each route change) from the OTel
+    // NavigationInstrumentation. Off by default. Independent of spa_routes (needs logs).
+    navigation_events: _bool(_c.navigation_events, false),
+    // Page-load timing.
+    // 'spans'  = document-load spans under page_view (default, also needs dom_elements)
+    // 'events' = browser.navigation_timing and browser.resource_timing log events from the
+    //            OTel NavigationTimingInstrumentation and ResourceTimingInstrumentation (needs logs)
+    load_timing:       _c.load_timing === 'events' ? 'events' : 'spans',
     console_capture:   _bool(_c.console_capture),
     network_requests:  _bool(_c.network_requests),
-    user_interactions: _bool(_c.user_interactions, false),
+    // true, false, or { enabled, event_names, trace }. An object without enabled means on.
+    //   event_names: passed to the stock plugin as eventNames.
+    //   trace: 'separate' (default) starts a new trace per interaction, linked to the
+    //          page_view trace. 'page_view' nests interactions under page_view (one trace).
+    user_interactions: (() => {
+        const u = _c.user_interactions;
+        const o = (u && typeof u === 'object') ? u : {};
+        const names = Array.isArray(o.event_names) ? o.event_names.filter(n => typeof n === 'string' && n) : [];
+        return {
+            enabled:     (u && typeof u === 'object') ? _bool(o.enabled, true) : _bool(u, false),
+            event_names: names.length ? names : _DEFAULT_UI_EVENTS,
+            trace:       o.trace === 'page_view' ? 'page_view' : 'separate',
+        };
+    })(),
     dom_elements:      _bool(_c.dom_elements),
     spa_routes:        _bool(_c.spa_routes, false),
 
@@ -246,6 +305,9 @@ const cfg = {
 
     console_banner:    _bool(_c.console_banner, _isDev),
 };
+
+// Only unified mode has a single page trace to nest interactions under.
+if (cfg.trace_mode !== 'unified') cfg.user_interactions.trace = 'separate';
 
 // Empty endpoint = same-origin (collector or auth-injecting proxy). Else the config wins.
 const baseUrl = cfg.endpoint || (typeof window !== 'undefined' && window.location ? window.location.origin : '');
@@ -465,6 +527,18 @@ if (typeof window !== 'undefined') {
 
 let _pageViewId = uuidv4();
 
+// Agent attribute keys with no OTel semconv equivalent, defined once. The OTel-standard
+// relation between two traces is a span link. These keys add a queryable trace ID.
+const ATTR_BROWSER_SPAN_TYPE      = 'browser.span_type';
+const ATTR_PAGE_VIEW_ID           = 'page_view.id';
+const ATTR_PAGE_VIEW_TRACE_ID     = 'page_view.trace_id';
+const ATTR_PAGE_VIEW_SPAN_ID      = 'page_view.span_id';
+const ATTR_USER_INTERACTION_TRACE_ID = 'user_interaction.trace_id';
+// Seconds, as OTel semconv uses for durations. The span duration is the total time.
+const ATTR_PAGE_VIEW_VISIBLE_DURATION = 'page_view.visible_duration';
+// Why the page view ended: 'pagehide' (unload or bfcache) or 'route_change' (SPA).
+const ATTR_PAGE_VIEW_END_REASON       = 'page_view.end_reason';
+
 // Static entity attrs per OTel semconv. Per-signal attrs (session.id, url.*,
 // client.address, network.connection.type) come from the identity processors.
 const _resourceAttrs = {
@@ -474,6 +548,7 @@ const _resourceAttrs = {
     [ATTR_TELEMETRY_DISTRO_VERSION]:    BRUM_VERSION,
 };
 if (cfg.service_version) _resourceAttrs[ATTR_SERVICE_VERSION] = cfg.service_version;
+if (cfg.service_namespace !== null) _resourceAttrs[ATTR_SERVICE_NAMESPACE] = cfg.service_namespace;
 
 // URL components are per-signal, not resource. Captured once, injected via _pageUrlAttrs.
 const _pageUrlAttrs = {};
@@ -543,7 +618,7 @@ function _injectPerSignalAttrs(target) {
             }
         }
         target.setAttribute(ATTR_SESSION_ID,   _currentSessionId());
-        target.setAttribute('page_view.id', _pageViewId);
+        target.setAttribute(ATTR_PAGE_VIEW_ID, _pageViewId);
         if (_clientAddress)         target.setAttribute(ATTR_CLIENT_ADDRESS,         _clientAddress);
         if (_networkConnectionType) target.setAttribute(ATTR_NETWORK_CONNECTION_TYPE, _networkConnectionType);
     } catch (_) {}
@@ -597,13 +672,17 @@ const _METRICS_ATTR_DENYLIST = new Set([
 const _metricsResourceAttrs = Object.fromEntries(
     Object.entries(_resourceAttrs).filter(([k]) => !_METRICS_ATTR_DENYLIST.has(k))
 );
-// Observe groups RED metrics by resource_metrics_key_attributes. An absent key differs
-// from a present-but-empty one, so these three always carry a value ('' when unset).
-_metricsResourceAttrs[ATTR_SERVICE_NAME]                = _metricsResourceAttrs[ATTR_SERVICE_NAME] || '';
-_metricsResourceAttrs[ATTR_DEPLOYMENT_ENVIRONMENT_NAME] = _metricsResourceAttrs[ATTR_DEPLOYMENT_ENVIRONMENT_NAME] || '';
-_metricsResourceAttrs[ATTR_SERVICE_NAMESPACE]           = cfg.service_namespace || '';
 const metricsResource = defaultResource()
     .merge(resourceFromAttributes(_metricsResourceAttrs, { schemaUrl: OTEL_SCHEMA_URL }));
+
+// RED metrics only. Observe groups them by resource_metrics_key_attributes, and an absent
+// key differs from a present-but-empty one, so these three always carry a value ('' when
+// unset). Other signals send service.namespace as configured, or not at all.
+const redMetricsResource = metricsResource.merge(resourceFromAttributes({
+    [ATTR_SERVICE_NAME]:                cfg.service_name || '',
+    [ATTR_DEPLOYMENT_ENVIRONMENT_NAME]: cfg.environment || '',
+    [ATTR_SERVICE_NAMESPACE]:           cfg.service_namespace !== null ? cfg.service_namespace : '',
+}, { schemaUrl: OTEL_SCHEMA_URL }));
 
 function _parseCfTraceIp(text) {
     if (typeof text !== 'string') return null;
@@ -726,10 +805,166 @@ function _publishTraceparentMeta() {
     meta.setAttribute('content', tp);
 }
 
+// User-interaction trace state. The stock plugin records the interactions. The agent only
+// chooses the parent and trace of each interaction span (see _uiTracerProvider).
+//   _uiSpans: every span the plugin starts.
+//   _uiTraceToPageView: interaction trace ID to the page_view span context it belongs to.
+//     Bounded, oldest entry first out.
+//   _uiTraceId: pre-spun interaction trace ID of the current page view, or null.
+const _UI_SPAN_TYPE       = 'user_interaction';
+const _UI_IGNORE_ATTR     = 'data-brum-ignore';
+const _UI_TRACE_MAP_MAX   = 256;
+const _uiSpans            = new WeakSet();
+const _uiTraceToPageView  = new Map();
+let   _uiTraceId          = null;
+
+// The SDK asks the IdGenerator for a trace ID only for a root span. _uiTracer sets
+// _nextRootTraceId around one startSpan call, so that root gets the pre-spun ID.
+const _randomIds = new RandomIdGenerator();
+let _nextRootTraceId = null;
+const _idGenerator = {
+    generateTraceId() {
+        const id = _nextRootTraceId;
+        _nextRootTraceId = null;
+        return id || _randomIds.generateTraceId();
+    },
+    generateSpanId() { return _randomIds.generateSpanId(); },
+};
+
+// True when the span in ctx belongs to an interaction: an interaction span itself, or any
+// span in an interaction trace. Requests made there keep that context.
+function _inInteraction(ctx) {
+    const s = trace.getSpan(ctx || context.active());
+    return !!s && (_uiSpans.has(s) || _uiTraceToPageView.has(s.spanContext().traceId));
+}
+
+// trace: 'separate'. Pre-spins one interaction trace ID per page view (init, SPA route
+// change, bfcache restore) and puts it on page_view as user_interaction.trace_id. Every
+// interaction on that page view uses this trace ID. With no interaction, nothing else
+// is sent, and the ID on page_view names a trace that does not exist.
+// An unsampled page_view gets no ID, so interactions become non-recording children of it.
+function _spinUiTrace() {
+    _uiTraceId = null;
+    if (!cfg.user_interactions.enabled || cfg.user_interactions.trace !== 'separate') return;
+    if (!_pageViewSpan) return;
+    const pvSc = _pageViewSpan.spanContext();
+    if ((pvSc.traceFlags & TraceFlags.SAMPLED) !== TraceFlags.SAMPLED) return;
+    _uiTraceId = _randomIds.generateTraceId();
+    _uiTraceToPageView.set(_uiTraceId, pvSc);
+    if (_uiTraceToPageView.size > _UI_TRACE_MAP_MAX) {
+        _uiTraceToPageView.delete(_uiTraceToPageView.keys().next().value);
+    }
+    _pageViewSpan.setAttribute(ATTR_USER_INTERACTION_TRACE_ID, _uiTraceId);
+}
+
+// Wraps the tracer of the user-interaction plugin. The plugin has no parent option, so
+// this sets the parent and nothing else. Nested events of one interaction keep their parent.
+//   separate:  a root span in the pre-spun trace, with a span link to page_view.
+//   page_view: parent is the current page_view.
+//   No page_view (split, stock): each interaction is the root of its own trace.
+function _uiTracer(inner) {
+    return {
+        startSpan(name, options = {}, ctx) {
+            const active = ctx || context.active();
+            const opts = { ...options, attributes: { ...options.attributes, [ATTR_BROWSER_SPAN_TYPE]: _UI_SPAN_TYPE } };
+            let span;
+            if (_inInteraction(active)) {
+                span = inner.startSpan(name, opts, active);
+            } else if (_uiTraceId) {
+                const pvSc = _uiTraceToPageView.get(_uiTraceId);
+                if (pvSc) opts.links = [...(options.links || []), { context: pvSc }];
+                _nextRootTraceId = _uiTraceId;
+                try { span = inner.startSpan(name, opts, ROOT_CONTEXT); }
+                finally { _nextRootTraceId = null; }
+            } else {
+                span = inner.startSpan(name, opts, _pageViewCtx || ROOT_CONTEXT);
+            }
+            _uiSpans.add(span);
+            return span;
+        },
+        startActiveSpan(...args) { return inner.startActiveSpan(...args); },
+    };
+}
+
+// Time on page. One INTERNAL span per page view, next to the interaction spans: a root
+// span in the pre-spun interaction trace (trace: 'separate'), or a child of page_view
+// (trace: 'page_view'). It starts with page_view and ends when the page view ends, so its
+// duration is the total time on the page. page_view.visible_duration leaves out the time
+// the tab was hidden. Span name is "visit {route}", the {verb} {target} form of GET /path.
+// A browser that discards a hidden tab without pagehide loses the span, as it loses any
+// open span.
+const _VISIT_SPAN_TYPE = 'page_visit';
+let _visit = null; // { span, visibleMs, visibleSince }
+
+const _isVisible = () => typeof document === 'undefined' || document.visibilityState !== 'hidden';
+
+function _startVisit(path, startTime) {
+    _visit = null;
+    if (!cfg.user_interactions.enabled || !_tracer || !_pageViewCtx) return;
+    const opts = {
+        kind:       SpanKind.INTERNAL,
+        startTime,
+        attributes: { [ATTR_BROWSER_SPAN_TYPE]: _VISIT_SPAN_TYPE },
+    };
+    let span;
+    if (_uiTraceId) {
+        const pvSc = _uiTraceToPageView.get(_uiTraceId);
+        if (pvSc) opts.links = [{ context: pvSc }];
+        _nextRootTraceId = _uiTraceId;
+        try { span = _tracer.startSpan(`visit ${path}`, opts, ROOT_CONTEXT); }
+        finally { _nextRootTraceId = null; }
+    } else {
+        span = _tracer.startSpan(`visit ${path}`, opts, _pageViewCtx);
+    }
+    // Not force-closed with the load subtree. _endVisit closes it at the end of the page view.
+    _openSpans.delete(span);
+    _visit = { span, visibleMs: 0, visibleSince: _isVisible() ? startTime : null };
+}
+
+function _endVisit(reason) {
+    if (!_visit) return;
+    const v = _visit;
+    _visit = null;
+    const now = Date.now();
+    if (v.visibleSince !== null) v.visibleMs += Math.max(0, now - v.visibleSince);
+    try {
+        v.span.setAttribute(ATTR_PAGE_VIEW_VISIBLE_DURATION, v.visibleMs / 1000);
+        v.span.setAttribute(ATTR_PAGE_VIEW_END_REASON, reason);
+        v.span.end(now);
+    } catch (_) {}
+}
+
+if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', () => {
+        if (!_visit) return;
+        const now = Date.now();
+        if (document.visibilityState === 'hidden') {
+            if (_visit.visibleSince !== null) _visit.visibleMs += Math.max(0, now - _visit.visibleSince);
+            _visit.visibleSince = null;
+        } else if (_visit.visibleSince === null) {
+            _visit.visibleSince = now;
+        }
+    }, { capture: true });
+}
+
+const _uiTracerProvider = {
+    getTracer(name, version, options) {
+        return _uiTracer(_tracerProvider.getTracer(name, version, options));
+    },
+};
+
 // Injects per-signal attrs on every span or log. Not resource attrs: session.id
 // rolls over and client.address describes the connection.
 const _identitySpanProcessor = {
-    onStart(span) { _injectPerSignalAttrs(span); },
+    onStart(span) {
+        _injectPerSignalAttrs(span);
+        // A span in a separate interaction trace names the page_view trace it came from.
+        const pv = _uiTraceToPageView.get(span.spanContext().traceId);
+        if (pv) {
+            span.setAttribute(ATTR_PAGE_VIEW_TRACE_ID, pv.traceId);
+            span.setAttribute(ATTR_PAGE_VIEW_SPAN_ID,  pv.spanId);
+        }
+    },
     onEnd() {},
     forceFlush() { return Promise.resolve(); },
     shutdown()   { return Promise.resolve(); },
@@ -777,7 +1012,7 @@ const _dropFilterProcessor = (inner) => ({
 });
 
 // Declared before Traces: the span-metrics processor needs these instruments when
-// WebTracerProvider is constructed.
+// TracerProvider is constructed.
 
 // Agent-side RED metrics need both signals: spans to read, and metrics to emit.
 const _agentMetricsOn = cfg.agent_metrics.enabled && cfg.metrics && cfg.traces;
@@ -792,7 +1027,7 @@ const _RED_SUMMARY_DIMS = ['span.name', 'span.kind', 'otel.status_code', 'observ
 
 // Metric Views for the RED streams. Both full-stream views are explicit: the SDK uses
 // the default aggregation only when no view matches, so registering only the .summary
-// views suppresses the full streams. web.vitals.* has no view and keeps its default.
+// views suppresses the full streams. The views live on the RED provider alone.
 function _redViews() {
     const lim  = cfg.agent_metrics.cardinality_limit;
     const sum  = { type: AggregationType.SUM };
@@ -821,24 +1056,32 @@ function _redViews() {
     return views;
 }
 
+const _mkMetricReader = () => new PeriodicExportingMetricReader({
+    exporter: withRetry(_mkOtlpExporter(OTLPMetricExporter, METRICS_URL, 'metrics', 'application/json', { temporalityPreference: 0 /* DELTA */ }), 'metrics'),
+    exportIntervalMillis: 30000,
+});
+
 let _meterProvider = null;
 if (cfg.metrics) {
-    _meterProvider = new MeterProvider({
-        resource: metricsResource,
-        ...(_agentMetricsOn ? { views: _redViews() } : {}),
-        readers: [
-            new PeriodicExportingMetricReader({
-                exporter: withRetry(_mkOtlpExporter(OTLPMetricExporter, METRICS_URL, 'metrics', 'application/json', { temporalityPreference: 0 /* DELTA */ }), 'metrics'),
-                exportIntervalMillis: 30000,
-            }),
-        ],
-    });
+    _meterProvider = new MeterProvider({ resource: metricsResource, readers: [_mkMetricReader()] });
     metrics.setGlobalMeterProvider(_meterProvider);
+}
+
+// A resource belongs to a whole MeterProvider, so RED metrics get their own provider
+// to carry redMetricsResource without changing the resource of web.vitals.*.
+let _redMeterProvider = null;
+if (_agentMetricsOn) {
+    _redMeterProvider = new MeterProvider({
+        resource: redMetricsResource,
+        views:    _redViews(),
+        readers:  [_mkMetricReader()],
+    });
 }
 
 // Metrics are DELTA and the reader interval is 30s, so every terminal path must flush.
 function _flushMetrics() {
     try { if (_meterProvider) _meterProvider.forceFlush(); } catch (_) {}
+    try { if (_redMeterProvider) _redMeterProvider.forceFlush(); } catch (_) {}
 }
 
 // Browser equivalent of Observe's `spanmetrics` connector: read each span as it ends
@@ -869,10 +1112,10 @@ const _RED_STATUS_DESC_MAX = 128;
 
 let _recordSpanMetrics = null;
 
-if (_agentMetricsOn && _meterProvider) {
-    // From _meterProvider directly, not the global getMeter(): the RED Views live on this
-    // provider, so the instruments must belong to it even if another SDK claimed the global.
-    const _meter = _meterProvider.getMeter(BRUM_SDK_NAME);
+if (_redMeterProvider) {
+    // From _redMeterProvider directly, not the global getMeter(): the RED Views and the
+    // RED resource live on this provider, so the instruments must belong to it.
+    const _meter = _redMeterProvider.getMeter(BRUM_SDK_NAME);
     const _calls = _meter.createCounter(RED_CALLS_METRIC, {
         description: 'Number of spans observed, by span name, kind and status.',
         valueType:   ValueType.INT,
@@ -964,20 +1207,29 @@ let _isUnloading    = false; // set on pagehide: skips async gzip so fetch fires
 if (cfg.traces) {
     // Identity and open-span tracker first, then batch export. _spanMetricsProcessor is
     // its own entry so it sees every span, exported or not.
-    _tracerProvider = new WebTracerProvider({
+    _tracerProvider = new TracerProvider({
         resource,
         sampler: new ParentBasedSampler({ root: new TraceIdRatioBasedSampler(cfg.trace_sample_rate) }),
+        idGenerator: _idGenerator,
         spanProcessors: [
             _identitySpanProcessor,
             _openSpanTracker,
             _spanMetricsProcessor,
-            _dropFilterProcessor(new BatchSpanProcessor(
-                withRetry(_mkOtlpExporter(OTLPTraceExporter, TRACE_URL, 'traces', 'application/json'), 'traces'),
-                { scheduledDelayMillis: 1000, maxExportBatchSize: 64, maxQueueSize: 2048, exportTimeoutMillis: 30000 }
-            )),
+            // sdk-trace 3.x takes a single options object, so the exporter is a named field.
+            _dropFilterProcessor(new BatchSpanProcessor({
+                exporter: withRetry(_mkOtlpExporter(OTLPTraceExporter, TRACE_URL, 'traces', 'application/json'), 'traces'),
+                scheduledDelayMillis: 1000, maxExportBatchSize: 64, maxQueueSize: 2048, exportTimeoutMillis: 30000,
+            })),
         ],
     });
-    _tracerProvider.register({ contextManager: new ZoneContextManager() });
+    // sdk-trace 3.x has no register(), so set the globals that WebTracerProvider.register() set.
+    const _contextManager = new ZoneContextManager();
+    _contextManager.enable();
+    context.setGlobalContextManager(_contextManager);
+    propagation.setGlobalPropagator(new CompositePropagator({
+        propagators: [new W3CTraceContextPropagator(), new W3CBaggagePropagator()],
+    }));
+    trace.setGlobalTracerProvider(_tracerProvider);
     _tracer = trace.getTracer(cfg.service_name);
 }
 
@@ -988,7 +1240,7 @@ if (cfg.logs) {
         resource,
         processors: [
             _identityLogRecordProcessor,
-            // sdk-logs (0.x) takes a single options object, so the exporter is a named field.
+            // sdk-logs takes a single options object, so the exporter is a named field.
             new BatchLogRecordProcessor({
                 exporter: withRetry(_mkOtlpExporter(OTLPLogExporter, LOGS_URL, 'logs', 'application/json'), 'logs'),
                 // Default 5s delay makes a single console.log wait 5s. Lower to ~1s, keep a batch ceiling.
@@ -1015,15 +1267,16 @@ if (cfg.traces && cfg.trace_mode === 'unified') {
         ? performance.getEntriesByType('navigation')[0]
         : undefined;
     const _pvStatus = (_navEntry && _navEntry.responseStatus > 0) ? _navEntry.responseStatus : undefined;
+    // Anchor to navigation start so the root encloses backdated child spans.
+    const _pvStart = (typeof performance !== 'undefined' && performance.timeOrigin)
+        ? performance.timeOrigin
+        : Date.now() - ((typeof performance !== 'undefined' && performance.now) ? performance.now() : 0);
     _pageViewSpan = _tracer.startSpan(`GET ${_pvPath}`, {
         kind: SpanKind.SERVER,
-        // Anchor to navigation start so the root encloses backdated child spans.
-        startTime: (typeof performance !== 'undefined' && performance.timeOrigin)
-            ? performance.timeOrigin
-            : Date.now() - ((typeof performance !== 'undefined' && performance.now) ? performance.now() : 0),
+        startTime: _pvStart,
         attributes: {
             // Marker off the span name so page_view stays queryable ({method} {route}).
-            'browser.span_type':      'page_view',
+            [ATTR_BROWSER_SPAN_TYPE]: 'page_view',
             [ATTR_HTTP_REQUEST_METHOD]: 'GET',
             [ATTR_HTTP_ROUTE]:          _pvPath,
             // undefined when unknown. setAttributes skips null-ish, so no fabricated status.
@@ -1041,6 +1294,8 @@ if (cfg.traces && cfg.trace_mode === 'unified') {
         _pageViewSpan.setStatus({ code: SpanStatusCode.ERROR });
     }
     _pageViewCtx = trace.setSpan(context.active(), _pageViewSpan);
+    _spinUiTrace();
+    _startVisit(_pvPath, _pvStart);
     if (typeof window !== 'undefined') {
         // Flushes traces, logs, and metrics. Callers (_endPageView, pagehide) end their
         // spans first, so the RED data points exist before this DELTA flush runs.
@@ -1086,6 +1341,7 @@ if (cfg.traces && cfg.trace_mode === 'unified') {
         window.addEventListener('pagehide', () => {
             _isUnloading = true;
             if (_failsafeTimer) { clearTimeout(_failsafeTimer); _failsafeTimer = null; }
+            _endVisit('pagehide');
             if (!_pageViewEnded) {
                 _pageViewEnded = true;
                 try { _pageViewSpan.end(); } catch (_) {}
@@ -1150,6 +1406,8 @@ if (typeof window !== 'undefined') {
 // Mints a fresh page_view span (new trace ID) on bfcache restore or SPA route change.
 function _reopenPageView() {
     if (!cfg.traces || !_tracer) return;
+    // SPA route change. After a bfcache restore, pagehide already ended the visit.
+    _endVisit('route_change');
     // End the previous span if still open (SPA nav). bfcache already closed it on pagehide.
     if (!_pageViewEnded && _pageViewSpan) {
         _pageViewEnded = true;
@@ -1178,12 +1436,13 @@ function _reopenPageView() {
     const _pvPath = normalizePath(
         (typeof window !== 'undefined' && window.location) ? window.location.pathname : '/'
     );
+    const _pvStart = Date.now();
     _pageViewSpan = _tracer.startSpan(`GET ${_pvPath}`, {
         kind: SpanKind.SERVER,
-        startTime: Date.now(),
+        startTime: _pvStart,
         attributes: {
             // Marker kept off the span name (see the unified init block).
-            'browser.span_type':      'page_view',
+            [ATTR_BROWSER_SPAN_TYPE]: 'page_view',
             [ATTR_HTTP_REQUEST_METHOD]: 'GET',
             [ATTR_HTTP_ROUTE]:          _pvPath,
             [ATTR_URL_PATH]:            (typeof window !== 'undefined' && window.location) ? window.location.pathname : '',
@@ -1195,13 +1454,17 @@ function _reopenPageView() {
     });
     _pageViewCtx  = trace.setSpan(context.active(), _pageViewSpan);
     _pageViewEnded = false;
+    // New page view, new interaction trace (SPA route change or bfcache restore).
+    _spinUiTrace();
+    _startVisit(_pvPath, _pvStart);
     // Refresh traceparent meta for the new trace (document-load does not re-run here).
     _publishTraceparentMeta();
 }
 
 // Per trace_mode:
-//   unified: stock document-load and user-interaction, registered inside _pageViewCtx,
-//            so their spans nest under page_view. fetch and XHR also parent there.
+//   unified: stock document-load, registered inside _pageViewCtx, so its spans nest under
+//            page_view. fetch and XHR also parent there, except inside an interaction.
+//            user_interactions.trace picks the interaction parent (see _uiTracer).
 //   split: enable everything stock. fetch and XHR are separate root traces.
 //   stock: enable everything stock, with no page_view.
 const otlpIgnore = [/\/v1\/(traces|metrics|logs)/];
@@ -1215,10 +1478,14 @@ if (cfg.client_ip && cfg.client_ip.enabled && cfg.client_ip.trace_url) {
 // Expose the real ignore list to the test suite (see the _internal note above).
 if (typeof window !== 'undefined' && window.__ogm && window.__ogm._internal) {
     window.__ogm._internal.netIgnoreUrls = otlpIgnore;
+    window.__ogm._internal.unregisterInstrumentations = () => {
+        _unregisterInstr.forEach(fn => fn());
+        _eventInstr.forEach(i => { try { i.disable(); } catch (_) {} });
+    };
 }
 
-const _useStockDocLoad = cfg.dom_elements;
-const _useStockUI      = cfg.user_interactions;
+// load_timing 'events' replaces the document-load spans with timing events (see below).
+const _useStockDocLoad = cfg.dom_elements && cfg.load_timing === 'spans';
 
 const _fetchHook = (span /*, request, response */) => {
     // fetch and XHR instrumentation still populates its base attrs under legacy keys
@@ -1263,8 +1530,11 @@ const _netInstrOptions = {
     applyCustomAttributesOnSpan: _fetchHook,
 };
 
+// Unregister functions from registerInstrumentations, exposed to the test suite only.
+const _unregisterInstr = [];
+
 if (cfg.traces) {
-    const _registerInstr = () => registerInstrumentations({
+    const _registerInstr = () => _unregisterInstr.push(registerInstrumentations({
         instrumentations: [
             getWebAutoInstrumentations({
                 '@opentelemetry/instrumentation-document-load': {
@@ -1291,34 +1561,62 @@ if (cfg.traces) {
                         },
                     },
                 },
-                '@opentelemetry/instrumentation-user-interaction': { enabled: _useStockUI },
+                // Registered on its own below, with the _uiTracerProvider wrapper.
+                '@opentelemetry/instrumentation-user-interaction': { enabled: false },
                 '@opentelemetry/instrumentation-fetch': { ..._netInstrOptions },
                 '@opentelemetry/instrumentation-xml-http-request': { ..._netInstrOptions },
             }),
         ],
-    });
+    }));
 
     // document-load parents its subtree only off <meta name="traceparent"> (it ignores the
     // active context). Publish page_view's context there so the load subtree nests under it.
     // Must run before the instrumentation's _collectPerformance reads the meta.
     _publishTraceparentMeta();
 
-    // Register within page_view context (unified), so user-interaction spans (which use
-    // the active context) can nest under page_view. Otherwise, register at root.
+    // Register within page_view context (unified). Otherwise, register at root.
     if (cfg.trace_mode === 'unified' && _pageViewCtx) {
         context.with(_pageViewCtx, _registerInstr);
     } else {
         _registerInstr();
     }
 
+    // Stock user-interaction plugin with stock options. Only its tracer is wrapped, to set
+    // the parent per user_interactions.trace. shouldPreventSpanCreation is the stock hook.
+    if (cfg.user_interactions.enabled) {
+        _unregisterInstr.push(registerInstrumentations({
+            tracerProvider: _uiTracerProvider,
+            instrumentations: [
+                new UserInteractionInstrumentation({
+                    eventNames: cfg.user_interactions.event_names,
+                    shouldPreventSpanCreation: (eventType, element, span) => {
+                        // Opt-out marker. The plugin does not end a prevented span, so end it
+                        // here and flag it so the export filter drops it.
+                        if (element && typeof element.closest === 'function' && element.closest(`[${_UI_IGNORE_ATTR}]`)) {
+                            span.setAttribute(_DROP_ATTR, true);
+                            span.end();
+                            return true;
+                        }
+                        // The plugin copies location.href raw. Scrub it like every other url.full.
+                        if (typeof window !== 'undefined' && window.location) {
+                            span.setAttribute(ATTR_URL_FULL, scrubUrl(window.location.href));
+                        }
+                        return false;
+                    },
+                }),
+            ],
+        }));
+    }
+
     // App-handler fetch calls fire in the ROOT zone (no active span). Wrap window.fetch so
-    // they fall back to _pageViewCtx and parent under page_view. No _pageViewEnded check:
+    // they fall back to _pageViewCtx and parent under page_view. A call inside an interaction
+    // keeps its context, so the request nests under the interaction that caused it. No _pageViewEnded check:
     // OTel accepts children of ended spans. No getActiveSpan() check: it false-negatives
     // during the load burst, when resource instrumentation holds an active span.
     if (cfg.network_requests && typeof window !== 'undefined' && window.fetch) {
         const _instrFetch = window.fetch.bind(window);
         window.fetch = function(...args) {
-            if (_pageViewCtx) {
+            if (_pageViewCtx && !_inInteraction()) {
                 return context.with(_pageViewCtx, () => _instrFetch(...args));
             }
             return _instrFetch(...args);
@@ -1330,7 +1628,7 @@ if (cfg.traces) {
     if (cfg.network_requests && typeof XMLHttpRequest !== 'undefined' && XMLHttpRequest.prototype && XMLHttpRequest.prototype.open) {
         const _instrOpen = XMLHttpRequest.prototype.open;
         XMLHttpRequest.prototype.open = function (...args) {
-            if (_pageViewCtx) {
+            if (_pageViewCtx && !_inInteraction()) {
                 return context.with(_pageViewCtx, () => _instrOpen.apply(this, args));
             }
             return _instrOpen.apply(this, args);
@@ -1338,10 +1636,60 @@ if (cfg.traces) {
     }
 }
 
+// Logger provider for the opentelemetry-browser event instrumentations. They emit in the
+// active context, which is the ROOT zone in most browser callbacks. The wrapper falls back
+// to _logCtx(), so each event correlates with page_view like the agent's own logs. It also
+// scrubs url.full like every other url.full. drop(record) true = the record is not emitted.
+function _eventLoggerProvider(drop) {
+    return {
+        getLogger(name, version, options) {
+            const inner = _loggerProvider.getLogger(name, version, options);
+            return {
+                emit(record) {
+                    let r = record;
+                    try {
+                        if (drop && drop(r)) return;
+                        r = { ...r };
+                        const url = r.attributes && r.attributes[ATTR_URL_FULL];
+                        if (typeof url === 'string') r.attributes = { ...r.attributes, [ATTR_URL_FULL]: scrubUrl(url) };
+                        if (!r.context) r.context = _logCtx();
+                    } catch (_) {}
+                    inner.emit(r);
+                },
+            };
+        },
+    };
+}
+
+// Enabled event instrumentations, exposed to the test suite only.
+const _eventInstr = [];
+if (typeof window !== 'undefined' && window.__ogm && window.__ogm._internal) {
+    window.__ogm._internal.eventInstrumentations = _eventInstr;
+}
+
+// The constructor only stores the config. The first enable() locks the wrapped logger
+// provider, so it is passed there. No logs signal = nothing to emit into.
+function _enableEventInstr(Instr, config = {}, drop) {
+    if (!_loggerProvider) return;
+    try {
+        const instr = new Instr(config);
+        instr.enable({ loggerProvider: _eventLoggerProvider(drop) });
+        _eventInstr.push(instr);
+    } catch (_) {}
+}
+
 let _flushCwv       = null;  // lifted to module scope so _reopenPageView can restart the LCP timer
 let _cwvEarlyTimer  = null;
 
-if (cfg.cwv_metrics && cfg.metrics) {
+// cwv_mode 'events': one browser.web_vital log event per report. reportAllChanges matches
+// the metrics path, so idle pages and quick exits still report. A metric can report more
+// than once: the latest event per browser.web_vital.id holds the value, and the
+// browser.web_vital.delta values add up to it.
+if (cfg.cwv_metrics && cfg.cwv_mode === 'events') {
+    _enableEventInstr(WebVitalsInstrumentation, { reportAllChanges: true });
+}
+
+if (cfg.cwv_metrics && cfg.cwv_mode === 'metrics' && cfg.metrics) {
     const meter = metrics.getMeter(BRUM_SDK_NAME);
 
     const lcp  = meter.createHistogram('web.vitals.lcp',  { unit: 'ms' });
@@ -1402,6 +1750,25 @@ if (cfg.cwv_metrics && cfg.metrics) {
     }
 }
 
+// One browser.navigation event for the hard load and for each route change. Only events:
+// spa_routes still decides whether a route change starts a new page_view.
+if (cfg.navigation_events) {
+    _enableEventInstr(NavigationInstrumentation, { sanitizeUrl: scrubUrl });
+}
+
+// load_timing 'events': one browser.navigation_timing event per document load, and one
+// browser.resource_timing event per resource. With network_requests on, a fetch or XHR call
+// already has its own CLIENT span, so its resource entry is dropped, as with resourceFetch.
+if (cfg.load_timing === 'events') {
+    _enableEventInstr(NavigationTimingInstrumentation);
+    const _dupNetTypes = (cfg.traces && cfg.network_requests) ? ['fetch', 'xmlhttprequest'] : [];
+    _enableEventInstr(
+        ResourceTimingInstrumentation,
+        { ignoreUrls: otlpIgnore },
+        (r) => _dupNetTypes.indexOf(r.attributes && r.attributes['browser.resource_timing.initiator_type']) >= 0,
+    );
+}
+
 // Resolve best context for log-trace correlation: active span (for example, a fetch
 // or XHR child), then page_view span, then SDK default.
 function _logCtx() {
@@ -1413,7 +1780,15 @@ function _logCtx() {
 if (cfg.errors && typeof window !== 'undefined') {
     const _sendLogs = cfg.error_mode !== 'span';
     const _sendSpan = cfg.error_mode !== 'logs';
-    const _logger   = (cfg.logs && _sendLogs) ? logs.getLogger('observe-brum') : null;
+    // error_source 'otel': the ErrorsInstrumentation writes the log record, so the agent
+    // writes none. Its listeners below still add the span event and the ERROR status.
+    const _otelErrors = cfg.error_source === 'otel';
+    const _logger   = (cfg.logs && _sendLogs && !_otelErrors) ? logs.getLogger('observe-brum') : null;
+    if (_sendLogs && _otelErrors) {
+        _enableEventInstr(ErrorsInstrumentation, {
+            applyCustomAttributes: () => ({ 'page.pathname': window.location.pathname }),
+        });
+    }
 
     const recordError = (err, source) => {
         const message = (err && err.message) || String(err) || 'unknown error';
@@ -1488,11 +1863,15 @@ if (cfg.console_banner && typeof console !== 'undefined' && console.log) {
     if (!cfg.metrics)                         _overrides.push('metrics:      off');
     if (!cfg.logs)                            _overrides.push('logs:         off');
     if (!cfg.cwv_metrics)                     _overrides.push('cwv_metrics:  off');
+    if (cfg.cwv_mode !== 'metrics')           _overrides.push('cwv_mode:     ' + cfg.cwv_mode);
     if (!cfg.errors)                          _overrides.push('errors:       off');
     if (cfg.error_mode !== 'logs')            _overrides.push('error_mode:   ' + cfg.error_mode);
+    if (cfg.error_source !== 'agent')         _overrides.push('error_source: ' + cfg.error_source);
+    if (cfg.navigation_events)                _overrides.push('nav_events:   on');
+    if (cfg.load_timing !== 'spans')          _overrides.push('load_timing:  ' + cfg.load_timing);
     if (!cfg.console_capture)                 _overrides.push('con_capture:  off');
     if (!cfg.network_requests)                _overrides.push('net_requests: off');
-    if (cfg.user_interactions)                _overrides.push('user_interact: on');
+    if (cfg.user_interactions.enabled)        _overrides.push(`user_interact: ${cfg.user_interactions.trace}`);
     if (!cfg.dom_elements)                    _overrides.push('dom_elements: off');
     if (!cfg.auto_path_normalization)         _overrides.push('auto_norm:    off');
     if (cfg.normalize_path)                   _overrides.push('normalize_path:fn');

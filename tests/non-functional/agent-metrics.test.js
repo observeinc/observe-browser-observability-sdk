@@ -111,6 +111,19 @@ const exportedSpans = () => {
   return out;
 };
 
+// Resource attribute sets of every captured export for one signal (traces, metrics, logs).
+const exportedResources = (signal) => {
+  const key = { traces: 'resourceSpans', metrics: 'resourceMetrics', logs: 'resourceLogs' }[signal];
+  const out = [];
+  for (const call of fetchMock.mock.calls) {
+    if (!String(call[0]).endsWith(`/v1/${signal}`)) continue;
+    let payload;
+    try { payload = bodyJson(call[1].body); } catch (_) { continue; }
+    for (const r of payload[key] || []) out.push(attrsOf((r.resource || {}).attributes));
+  }
+  return out;
+};
+
 const settle = async (ticks = 8) => {
   for (let i = 0; i < ticks; i++) await new Promise((r) => setTimeout(r, 0));
 };
@@ -119,7 +132,7 @@ const settle = async (ticks = 8) => {
  * Loads the bundle with the given agent_metrics config, optionally makes an
  * outbound call, then fires pagehide so page_view ends and every provider flushes.
  */
-const boot = async ({ agentMetrics, config = {}, call } = {}) => {
+const boot = async ({ agentMetrics, config = {}, call, before } = {}) => {
   delete window.OBSERVE_BRUM;
   delete window.__ogm;
   // Each eval re-registers the OTel global API. Clearing it keeps loads isolated so
@@ -164,6 +177,8 @@ const boot = async ({ agentMetrics, config = {}, call } = {}) => {
     try { await window.fetch(call, { method: 'GET' }); } catch (_) { /* mock response */ }
     await settle(2);
   }
+
+  if (before) { before(); await settle(2); }
 
   // pagehide ends page_view, force-closes any still-open span (so the fetch span is
   // metered), then flushes traces, logs and metrics.
@@ -261,6 +276,69 @@ describe('emitted streams and instrument shape', () => {
     await boot({ agentMetrics: { enabled: true }, config: { service_namespace: 'payments' } });
     const p = redPoints()[0];
     expect(p.resourceAttrs['service.namespace']).toBe('payments');
+  });
+});
+
+describe('service.namespace on signals other than RED metrics', () => {
+  // RED metrics fall back to '' (see above). Every other signal sends the configured
+  // value as given, or no key at all. Bundles from earlier tests still wrap console and
+  // fetch, so each boot gets its own service.name and only its own resources are read.
+  let svc = '';
+  let bootCount = 0;
+  const navEntry = { entryType: 'navigation', name: 'http://localhost/test.html', type: 'navigate', startTime: 0, responseStart: 5, activationStart: 0 };
+  const bootAll = async (config) => {
+    svc = `namespace-app-${++bootCount}`;
+    const origEntries = global.performance.getEntriesByType;
+    global.performance.getEntriesByType = (type) => (type === 'navigation' ? [navEntry] : []);
+    try {
+      await boot({
+        agentMetrics: { enabled: true },
+        config: { service_name: svc, logs: true, console_capture: true, cwv_metrics: true, ...config },
+        call: 'http://api.example.com/api/accounts',
+        before: () => console.log('namespace test log'),
+      });
+    } finally {
+      global.performance.getEntriesByType = origEntries;
+    }
+  };
+  const own = (sets) => sets.filter((a) => a['service.name'] === svc);
+  const traceResources = () => own(exportedResources('traces'));
+  const logResources = () => own(exportedResources('logs'));
+  const cwvResources = () => own(exportedPoints().filter((p) => p.name.startsWith('web.vitals.')).map((p) => p.resourceAttrs));
+
+  test('the key is absent on traces, logs and web.vitals.* when unconfigured', async () => {
+    await bootAll({});
+    const sets = [...traceResources(), ...logResources(), ...cwvResources()];
+    expect(traceResources().length).toBeGreaterThan(0);
+    expect(logResources().length).toBeGreaterThan(0);
+    expect(cwvResources().length).toBeGreaterThan(0);
+    for (const attrs of sets) expect('service.namespace' in attrs).toBe(false);
+    const red = redPoints().filter((p) => p.resourceAttrs['service.name'] === svc);
+    expect(red.length).toBeGreaterThan(0);
+    for (const p of red) expect(p.resourceAttrs['service.namespace']).toBe('');
+  });
+
+  test('null is treated as unconfigured', async () => {
+    await bootAll({ service_namespace: null });
+    expect(traceResources().length).toBeGreaterThan(0);
+    for (const attrs of traceResources()) expect('service.namespace' in attrs).toBe(false);
+  });
+
+  test('a configured value reaches traces, logs and web.vitals.*', async () => {
+    await bootAll({ service_namespace: 'payments' });
+    const sets = [...traceResources(), ...logResources(), ...cwvResources()];
+    expect(sets.length).toBeGreaterThan(0);
+    for (const attrs of sets) expect(attrs['service.namespace']).toBe('payments');
+  });
+
+  test('an empty string is treated as unconfigured', async () => {
+    await bootAll({ service_namespace: '' });
+    const sets = [...traceResources(), ...logResources(), ...cwvResources()];
+    expect(traceResources().length).toBeGreaterThan(0);
+    for (const attrs of sets) expect('service.namespace' in attrs).toBe(false);
+    const red = redPoints().filter((p) => p.resourceAttrs['service.name'] === svc);
+    expect(red.length).toBeGreaterThan(0);
+    for (const p of red) expect(p.resourceAttrs['service.namespace']).toBe('');
   });
 });
 

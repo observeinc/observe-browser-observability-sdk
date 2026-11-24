@@ -27,12 +27,16 @@ npm run test:watch
 ## Test Structure
 
 ```
-observe-brum/
+observe-browser-observability-sdk/
 ├── tests/
 │   ├── non-functional/
 │   │   ├── setup.js                    # Jest setup (browser mocks)
 │   │   ├── brum.test.js                # Unit tests (config, API)
-│   │   └── bundle-integration.test.js  # Integration tests (compiled bundle)
+│   │   ├── bundle-integration.test.js  # Integration tests (compiled bundle)
+│   │   ├── agent-metrics.test.js       # Agent RED metrics (agent_metrics)
+│   │   ├── gzip-transport.test.js      # Gzip transport for OTLP exports (Node environment)
+│   │   ├── otel-browser-instrumentation.test.js  # cwv_mode, error_source, navigation_events, load_timing
+│   │   └── user-interactions.test.js   # User interaction spans (user_interactions)
 │   └── functional/
 │       ├── collector/                  # Mock OTLP/HTTP JSON collector
 │       ├── browser/                    # chromedp driver + remote Chrome discovery
@@ -45,14 +49,14 @@ observe-brum/
 
 ## CI/CD Integration
 
-GitHub Actions workflow included at `.github/workflows/test.yml`:
+The Test workflow in `.github/workflows/test.yml` runs on each pull request that targets `main`. It has two jobs:
 
-```yaml
-- name: Run tests
-  run: npm run test:coverage
-```
+- Unit tests: The job builds the bundle, then runs `npm run test:coverage`.
+- Functional tests: The job runs `./test.sh --functional`, which uses Docker and headless Chrome.
 
-Coverage is reported as text output (no HTML reports) suitable for CI logs.
+If a job fails, the pull request shows a failed check. To block a merge on a failed check, add the two jobs as required status checks in the branch protection rules for `main`.
+
+The coverage report is text output in the CI log. The workflow does not make HTML reports.
 
 ## Coverage
 
@@ -113,7 +117,7 @@ test('withPageContext executes function', () => {
     endPageView: () => {},
     sessionId: 'session-123',
     pageViewId: 'pageview-456',
-    version: '0.0.5',
+    version: '0.1.0',
   };
 
   const result = window.__ogm.withPageContext(() => 42);
@@ -161,7 +165,7 @@ npm run build   # dist/observe-brum.js must exist first
 docker compose -f tests/functional/docker-compose.yml up --abort-on-container-exit --exit-code-from gotest
 ```
 
-Runs automatically in CI via `.github/workflows/functional-test.yml`.
+The Test workflow in `.github/workflows/test.yml` runs this suite on each pull request that targets `main`.
 
 #### Local Go run (no Docker)
 

@@ -1,0 +1,172 @@
+# Sample OpenTelemetry Collector configuration: aggregate Core Web Vitals before Observe.
+#
+# Status: sample only. On otelcol-contrib 0.164.0 it passes `otelcol-contrib validate`,
+# and a local test merged two LCP points from two browsers into one point. The Observe
+# BRUM team does not test it end to end against Observe. Pin the collector version that
+# you use, and test it with your own traffic before production.
+#
+# What it does
+#   Each browser sends its own web.vitals.* data points. Observe bills every data point,
+#   so the cost grows with the number of browsers. This configuration merges the points
+#   from all browsers into one point per series for each 60 second window. A series is one
+#   unique combination of metric name, resource and the attributes page, rating and
+#   navigation_type.
+#   Traces, logs and all other metrics (for example traces.span.metrics.*) pass through
+#   without change.
+#
+# How it works (pipeline metrics/cwv)
+#   1. filter/cwv_only keeps the web.vitals.* metrics only.
+#   2. transform/cwv_resource keeps a short allow list of resource attributes. Data from
+#      different browsers then has the same resource.
+#   3. batch/cwv holds the data for 60 seconds.
+#   4. transform/cwv_window gives every data point in the batch the same time window.
+#      The merge in step 6 joins only points with equal timestamps.
+#   5. groupbyattrs/compact joins the data from all requests into one resource and one
+#      metric for each name.
+#   6. metricstransform/cwv_merge adds together the histograms that have equal attributes.
+#
+# Limits
+#   - Every collector replica aggregates on its own. With 3 replicas behind a load balancer,
+#     Observe gets up to 3 points for each series in each window. One replica, or a
+#     dedicated metrics tier, gives the most reduction.
+#   - The batch processor keeps data in memory for up to 60 seconds. If the collector
+#     stops, that data is lost.
+#   - If a batch fills before the timeout (send_batch_size), it leaves early. Its window is
+#     then shorter than 60 seconds but carries a 60 second start time.
+#   - groupbyattrs, metricstransform and transform are beta components.
+#
+# Browser configuration
+#   Point the agent at this collector and remove the Observe token from the page. The
+#   collector adds the token on export:
+#     window.OBSERVE_BRUM = { endpoint: 'https://otel.example.com', ... };
+#
+# Environment variables
+#   OBSERVE_ENDPOINT  for example https://123456789012.collect.observeinc.com/v2/otel
+#   OBSERVE_TOKEN     the datastream token
+#   BRUM_ORIGIN       the origin of your site, for example https://www.example.com
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+        # Browsers send cross-origin requests, so the receiver must answer CORS preflights.
+        cors:
+          allowed_origins:
+            - ${env:BRUM_ORIGIN}
+          allowed_headers:
+            - Content-Type
+          max_age: 7200
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
+  # Each pipeline gets its own copy of the data from the receiver.
+  filter/cwv_only:
+    error_mode: ignore
+    metrics:
+      metric:
+        - 'not IsMatch(name, "^web\\.vitals\\.")'
+
+  filter/not_cwv:
+    error_mode: ignore
+    metrics:
+      metric:
+        - 'IsMatch(name, "^web\\.vitals\\.")'
+
+  # The agent puts no per-browser attributes on the metrics resource today. This allow list
+  # keeps the merge correct if a proxy or a later agent version adds some.
+  transform/cwv_resource:
+    error_mode: ignore
+    metric_statements:
+      - context: resource
+        statements:
+          - keep_keys(resource.attributes, ["service.name", "service.namespace", "service.version", "deployment.environment.name", "telemetry.distro.name", "telemetry.distro.version", "telemetry.sdk.name", "telemetry.sdk.language", "telemetry.sdk.version"])
+
+  batch/cwv:
+    timeout: 60s
+    send_batch_size: 100000
+    send_batch_max_size: 0
+
+  # Runs after batch/cwv, so Now() is the time that the batch leaves. Truncation to the
+  # second gives all points in one batch the same timestamp. The window is the 60 seconds
+  # before that time.
+  transform/cwv_window:
+    error_mode: ignore
+    metric_statements:
+      - context: datapoint
+        statements:
+          - set(datapoint.time, TruncateTime(Now(), Duration("1s")))
+          - set(datapoint.start_time_unix_nano, datapoint.time_unix_nano - 60000000000)
+
+  # An empty key list compacts: equal resources become one, and metrics with the same name
+  # and type become one metric with all the data points.
+  groupbyattrs/compact: {}
+
+  # aggregate_labels groups points by the attributes in label_set and adds the histograms
+  # together. Only "sum" is valid for histograms.
+  # To reduce DPM more, remove "rating" from label_set. The rating comes from the value and
+  # fixed thresholds, so a query can compute it again from the histogram buckets.
+  metricstransform/cwv_merge:
+    transforms:
+      - include: ^web\.vitals\.
+        match_type: regexp
+        action: update
+        operations:
+          - action: aggregate_labels
+            label_set: [page, rating, navigation_type]
+            aggregation_type: sum
+
+  batch:
+    timeout: 1s
+
+exporters:
+  otlphttp/observe_metrics:
+    endpoint: ${env:OBSERVE_ENDPOINT}
+    headers:
+      authorization: Bearer ${env:OBSERVE_TOKEN}
+      x-observe-target-package: Metrics
+
+  otlphttp/observe_traces:
+    endpoint: ${env:OBSERVE_ENDPOINT}
+    headers:
+      authorization: Bearer ${env:OBSERVE_TOKEN}
+      x-observe-target-package: Tracing
+
+  otlphttp/observe_logs:
+    endpoint: ${env:OBSERVE_ENDPOINT}
+    headers:
+      authorization: Bearer ${env:OBSERVE_TOKEN}
+      x-observe-target-package: Logging
+
+service:
+  pipelines:
+    metrics/cwv:
+      receivers: [otlp]
+      processors:
+        - memory_limiter
+        - filter/cwv_only
+        - transform/cwv_resource
+        - batch/cwv
+        - transform/cwv_window
+        - groupbyattrs/compact
+        - metricstransform/cwv_merge
+      exporters: [otlphttp/observe_metrics]
+
+    metrics/other:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/not_cwv, batch]
+      exporters: [otlphttp/observe_metrics]
+
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/observe_traces]
+
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/observe_logs]

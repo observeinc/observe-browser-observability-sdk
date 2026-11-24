@@ -6,6 +6,7 @@ package functional
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -115,7 +116,13 @@ func assertTraces(t *testing.T, store *collector.Store) {
 		if sp.EndNanos < sp.StartNanos {
 			t.Errorf("span %q: endTime (%d) before startTime (%d)", sp.Name, sp.EndNanos, sp.StartNanos)
 		}
-		if sp.TraceID != root.TraceID {
+		// user_interactions defaults to trace: 'separate'. Spans in an interaction trace
+		// name the page_view trace instead (see assertUserInteraction).
+		if pv, ok := sp.Attrs["page_view.trace_id"]; ok {
+			if pv != root.TraceID {
+				t.Errorf("span %q: page_view.trace_id %v, want page_view trace %q", sp.Name, pv, root.TraceID)
+			}
+		} else if sp.TraceID != root.TraceID {
 			t.Errorf("span %q: traceId %q does not match page_view trace %q: unified trace_mode must parent everything under one trace", sp.Name, sp.TraceID, root.TraceID)
 		}
 	}
@@ -146,6 +153,84 @@ func assertTraces(t *testing.T, store *collector.Store) {
 	}
 	if !foundFetch {
 		t.Error("expected at least one CLIENT-kind span from instrumented fetch(), found none")
+	}
+
+	assertUserInteraction(t, spans, root)
+}
+
+// assertUserInteraction checks the click on #click-target. The fixture enables
+// user_interactions with the default trace: 'separate'. page_view carries a pre-spun
+// user_interaction.trace_id, each click span is a root span in that trace and names
+// page_view, and the fetch in the handler is a child of a click span. The stock plugin
+// makes one span per click listener, so more than one click span can exist.
+func assertUserInteraction(t *testing.T, spans []collector.Span, root *collector.Span) {
+	t.Helper()
+	uiTrace, _ := root.Attrs["user_interaction.trace_id"].(string)
+	if len(uiTrace) != 32 || uiTrace == root.TraceID {
+		t.Fatalf("page_view: user_interaction.trace_id = %q, want a 32-hex trace ID that is not the page_view trace", uiTrace)
+	}
+
+	clicks := map[string]bool{}
+	for _, sp := range spans {
+		if sp.Attrs["browser.span_type"] != "user_interaction" || sp.Name != "click" {
+			continue
+		}
+		clicks[sp.SpanID] = true
+		if sp.TraceID != uiTrace {
+			t.Errorf("click: traceId = %q, want page_view user_interaction.trace_id %q", sp.TraceID, uiTrace)
+		}
+		if sp.ParentSpanID != "" {
+			t.Errorf("click: parentSpanId = %q, want none (root span of the interaction trace)", sp.ParentSpanID)
+		}
+		if sp.Attrs["page_view.span_id"] != root.SpanID {
+			t.Errorf("click: page_view.span_id = %v, want %q", sp.Attrs["page_view.span_id"], root.SpanID)
+		}
+		if sp.Attrs["target_element"] != "BUTTON" {
+			t.Errorf("click: target_element = %v, want BUTTON", sp.Attrs["target_element"])
+		}
+	}
+	if len(clicks) == 0 {
+		t.Fatal("expected a click span with browser.span_type \"user_interaction\", not found")
+	}
+
+	foundChild := false
+	for _, sp := range spans {
+		if u, _ := sp.Attrs["url.full"].(string); sp.Kind == 3 && strings.Contains(u, "from=click") {
+			foundChild = true
+			if !clicks[sp.ParentSpanID] {
+				t.Errorf("click fetch: parentSpanId = %q, want a click span", sp.ParentSpanID)
+			}
+			if sp.TraceID != uiTrace {
+				t.Errorf("click fetch: traceId = %q, want interaction trace %q", sp.TraceID, uiTrace)
+			}
+		}
+	}
+	if !foundChild {
+		t.Error("expected a CLIENT span for the fetch in the click handler, found none")
+	}
+
+	// Time on page: one page_visit span per page view, a root span in the interaction trace.
+	visits := 0
+	for _, sp := range spans {
+		if sp.Attrs["browser.span_type"] != "page_visit" {
+			continue
+		}
+		visits++
+		if sp.TraceID != uiTrace || sp.ParentSpanID != "" {
+			t.Errorf("page_visit: trace %q parent %q, want root span in interaction trace %q", sp.TraceID, sp.ParentSpanID, uiTrace)
+		}
+		if sp.Name != "visit "+fmt.Sprint(root.Attrs["http.route"]) {
+			t.Errorf("page_visit: name = %q, want \"visit %v\"", sp.Name, root.Attrs["http.route"])
+		}
+		if d, ok := sp.Attrs["page_view.visible_duration"].(float64); !ok || d < 0 {
+			t.Errorf("page_visit: page_view.visible_duration = %v, want a number of seconds >= 0", sp.Attrs["page_view.visible_duration"])
+		}
+		if sp.EndNanos < root.EndNanos {
+			t.Errorf("page_visit: ends before page_view, want it to last until the page view ends")
+		}
+	}
+	if visits != 1 {
+		t.Errorf("page_visit spans = %d, want 1", visits)
 	}
 }
 
@@ -178,6 +263,10 @@ func assertMetrics(t *testing.T, store *collector.Store) {
 		}
 		if p.Count <= 0 {
 			t.Errorf("metric %q: count = %d, want > 0", p.MetricName, p.Count)
+		}
+		// The fixture sets no service_namespace. Only RED metrics fall back to "".
+		if _, ok := p.ResourceAttrs["service.namespace"]; ok {
+			t.Errorf("metric %q: resource service.namespace is present, want absent when unconfigured", p.MetricName)
 		}
 		// Required dimensions per src/brum.js CWV recording.
 		for _, dim := range []string{"page", "rating", "navigation_type"} {
@@ -387,6 +476,10 @@ func assertResourceAttrs(t *testing.T, attrs map[string]interface{}) {
 		if _, ok := attrs[k]; !ok {
 			t.Errorf("resource attr %q missing", k)
 		}
+	}
+	// The fixture sets no service_namespace, so the key follows the configuration: absent.
+	if _, ok := attrs["service.namespace"]; ok {
+		t.Errorf("resource attr \"service.namespace\" is present, want absent when unconfigured")
 	}
 }
 

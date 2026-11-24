@@ -367,12 +367,12 @@ describe('Duplicate resource-span suppression', () => {
     // The exact processor and marker the bundle ships, not a re-implementation.
     const { dropFilterProcessor, DROP_ATTR } = window.__ogm._internal;
     const {
-      BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor,
-    } = require('@opentelemetry/sdk-trace-base');
+      TracerProvider, InMemorySpanExporter, SimpleSpanProcessor,
+    } = require('@opentelemetry/sdk-trace');
 
     const exporter = new InMemorySpanExporter();
-    const provider = new BasicTracerProvider({
-      spanProcessors: [dropFilterProcessor(new SimpleSpanProcessor(exporter))],
+    const provider = new TracerProvider({
+      spanProcessors: [dropFilterProcessor(new SimpleSpanProcessor({ exporter }))],
     });
     const tracer = provider.getTracer('test');
 

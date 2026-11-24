@@ -113,13 +113,13 @@ describe('BRUM API', () => {
       endPageView: () => {},
       sessionId: 'session-123',
       pageViewId: 'pageview-456',
-      version: '0.0.3',
+      version: '0.1.0',
     };
 
     expect(window.__ogm).toBeDefined();
     expect(window.__ogm.sessionId).toBe('session-123');
     expect(window.__ogm.pageViewId).toBe('pageview-456');
-    expect(window.__ogm.version).toBe('0.0.3');
+    expect(window.__ogm.version).toBe('0.1.0');
   });
 
   test('withPageContext executes function', () => {
@@ -130,7 +130,7 @@ describe('BRUM API', () => {
       endPageView: () => {},
       sessionId: 'session-123',
       pageViewId: 'pageview-456',
-      version: '0.0.3',
+      version: '0.1.0',
     };
 
     window.__ogm.withPageContext(() => {
@@ -146,7 +146,7 @@ describe('BRUM API', () => {
       endPageView: () => {},
       sessionId: 'session-123',
       pageViewId: 'pageview-456',
-      version: '0.0.3',
+      version: '0.1.0',
     };
 
     const result = window.__ogm.withPageContext(() => 42);
@@ -160,7 +160,7 @@ describe('BRUM API', () => {
       endPageView: () => {},
       sessionId: 'session-123',
       pageViewId: 'pageview-456',
-      version: '0.0.3',
+      version: '0.1.0',
     };
 
     const result = await window.__ogm.withPageContext(async () => {
@@ -178,7 +178,7 @@ describe('BRUM API', () => {
       endPageView: endPageViewMock,
       sessionId: 'session-123',
       pageViewId: 'pageview-456',
-      version: '0.0.3',
+      version: '0.1.0',
     };
 
     window.__ogm.endPageView();
